@@ -36,9 +36,7 @@ jobs:
         run: |
           python a2o_loadtest.py --url https://example.com/ --concurrency 100 \
             --duration 10 --max-egress-mb 100 --authorized --dry-run --json > plan.json
-          python -c "import json; p = json.load(open('plan.json')); \
-assert p['concurrency'] == 100 and p['engine'] == 'threads' and p['segments'] == 1, p; \
-print('plan ok:', p['probe_bytes'], 'B per request, fuse =', p['fuse'])"
+          python -c "import json; p = json.load(open('plan.json')); assert p['concurrency'] == 100 and p['engine'] == 'threads' and p['segments'] == 1, p; print('plan ok:', p['probe_bytes'], 'B per request, fuse =', p['fuse'])"
 
       - name: Reject malformed probe size
         run: |
@@ -61,6 +59,4 @@ print('plan ok:', p['probe_bytes'], 'B per request, fuse =', p['fuse'])"
       - name: Model without network
         run: |
           python a2o_probe.py --model-only --json > model.json
-          python -c "import json; d = json.load(open('model.json')); \
-assert d['model']['asset_bytes'] > 0; \
-print('model ok:', d['model']['asset_bytes'], 'B assumed object size')"
+          python -c "import json; d = json.load(open('model.json')); assert d['model']['asset_bytes'] > 0; print('model ok:', d['model']['asset_bytes'], 'B assumed object size')"
