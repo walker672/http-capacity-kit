@@ -73,10 +73,12 @@ python a2o_loadtest.py --url https://example.com/assets/app.js \
 python a2o_loadtest.py --scan --url https://example.com/ --min-size 1m --out urls.txt
 ```
 
-流程：抓入口 HTML → 正则抽取 `src` / `href` / `poster` / `srcset` / `url()` / 绝对 URL → 跟读 JS/CSS（默认 1 层）再抽一遍 → 逐个 `HEAD` 或 `Range 0-0` 称重 → 按体积降序写清单。
+流程：抓入口 HTML → 正则抽取 `src` / `href` / `poster` / `srcset` / `url()` / 绝对 URL → 跟读 JS/CSS（默认 1 层）再抽一遍 → 并行称重（8 路 `HEAD` 或 `Range 0-0`）→ 按体积降序写清单。
 
 - 只发几十次普通 GET，不算压测，不需要 `--authorized`
+- 自动跟随最多 5 次重定向，`http→https`、`/→/index.html` 这类跳转不会让扫描拿到空页面
 - 同域扫不到资源时自动放宽到任意主机（CDN / 对象存储常与站点不同域）
+- 4xx/5xx 响应一律丢弃：错误页有体积但不是资源，别让它混进清单
 - `--max-items` 控制清单长度，`--scan-follow 0` 只看首页不跟 JS
 
 ### 搬运大体积数据
@@ -99,14 +101,19 @@ python a2o_loadtest.py --url-file urls.txt --probe-bytes 1m --segments 4 \
  汇总
  目标               https://example.com/assets/app.js
  并发 / 实际时长      200 / 80.2s
- 完成请求 / 实际 QPS  41,882 / 522 req/s
+ 完成请求           41,882
+  QPS 整体 / 稳态      522 / 587
  状态码分布           {200: 41882}
  错误               0.00%
- 延迟 基线/p50/p95/p99  85 / 96 / 210 / 640 ms
+ 延迟 基线/p50/p95/p99  85 / 96 / 210 / 640 ms（最大 1,180）
  本次测试出流量       287.4 MB（3.58 MB/s · 28.7 Mbit/s）
 
  判定：200 并发未报错，但 p95 放大 2.5x → 接近饱和
 ```
+
+**整体 QPS 与稳态 QPS 的区别**：整体把爬坡期也算进分母，那时候并发还没起满，所以一定偏低。稳态只统计爬坡结束后那段时间，才和其他工具/其他档位的数字可比。爬坡越长，两者差距越大——稳态区间不足 3 秒时直接显示 `—`，不给噪声数字。
+
+如果某次运行出现 `WinError 10048/10055`，汇总下面会单独打一段诊断：那是本机临时端口耗尽，属于客户端瓶颈，不是站点限流。
 
 逐秒时序表用来找**劣化拐点**，而不是只看平均值——容量问题总是先出现在 p99 和成功率的抖动上。
 

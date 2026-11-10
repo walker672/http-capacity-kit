@@ -73,10 +73,12 @@ A site's HTML is usually just a shell; the real bulk (images, video, audio) live
 python a2o_loadtest.py --scan --url https://example.com/ --min-size 1m --out urls.txt
 ```
 
-Pipeline: fetch the entry HTML → extract `src` / `href` / `poster` / `srcset` / `url()` / absolute URLs → follow JS and CSS (one level by default) and extract again → `HEAD` or `Range 0-0` each candidate for its size → sort by size and write the list.
+Pipeline: fetch the entry HTML → extract `src` / `href` / `poster` / `srcset` / `url()` / absolute URLs → follow JS and CSS (one level by default) and extract again → weigh candidates in parallel (8 workers, `HEAD` or `Range 0-0` each) → sort by size and write the list.
 
 - Sends a few dozen ordinary GETs. It is not load testing and needs no `--authorized`
+- Follows up to 5 redirects, so `http→https` or `/→/index.html` cannot leave the scan with an empty page
 - Falls back to any-host scanning when nothing is found on the same host (CDNs and object storage often live on another domain)
+- 4xx/5xx responses are dropped: an error page has a size, but it is not an asset
 - `--max-items` caps the list, `--scan-follow 0` skips JS/CSS
 
 ### Moving large volumes
@@ -101,14 +103,19 @@ The console report is in Chinese; pass `--json` when you need stable machine-rea
  汇总
  目标               https://example.com/assets/app.js
  并发 / 实际时长      200 / 80.2s
- 完成请求 / 实际 QPS  41,882 / 522 req/s
+ 完成请求           41,882
+  QPS 整体 / 稳态      522 / 587
  状态码分布           {200: 41882}
  错误               0.00%
- 延迟 基线/p50/p95/p99  85 / 96 / 210 / 640 ms
+ 延迟 基线/p50/p95/p99  85 / 96 / 210 / 640 ms（最大 1,180）
  本次测试出流量       287.4 MB（3.58 MB/s · 28.7 Mbit/s）
 
  判定：200 并发未报错，但 p95 放大 2.5x → 接近饱和
 ```
+
+Two QPS figures are reported. **Overall** includes the ramp-up window, when concurrency is still climbing, so it always reads low. **Steady** counts only the post-ramp period, which makes runs with different ramp lengths comparable to each other and to other tools. If the steady window is under 3 seconds the field shows `—` rather than a noisy number.
+
+When a run hits `WinError 10048/10055`, a diagnostic block is printed under the summary: that is local ephemeral-port exhaustion, a client-side ceiling, not server-side rate limiting.
 
 The per-second timeline is for finding the **degradation knee**, not the average — capacity problems always show up first in p99 and in success-rate jitter.
 

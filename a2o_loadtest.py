@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import http.client
 import json
 import re
@@ -96,6 +97,7 @@ ASSET_EXT = (".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".bmp",
              ".pdf", ".zip", ".woff2", ".woff", ".js", ".css")
 SCAN_HTML_MAX = 4 << 20       # 单个 HTML/CSS/JS 最多读 4MB，够抽 URL 了
 SCAN_PROBE_MAX = 200          # 最多给多少个候选做体积探测（每个一次 HEAD）
+SCAN_WORKERS = 8              # 并行称重的线程数：串行逐个 HEAD 在 200 个候选上要一分钟
 
 
 # ---------------------------------------------------------------- 目标解析
@@ -147,6 +149,7 @@ class Stats:
         self.next_report = REPORT_EVERY        # 下一次打累计概况的时刻
         self.user_stop = False                 # 是否被 Ctrl+C 主动中断
         self.inflight = 0                      # 在途请求已预留的字节额度
+        self.port_exhausted = False            # 是否撞上本机临时端口耗尽
         self._prune_at = 0
 
     def reserve(self, cap: int, n: int) -> bool:
@@ -177,11 +180,11 @@ class Stats:
         with self._lock:
             self.total += 1
             self.status[status] = self.status.get(status, 0) + 1
+            self.bytes += nbytes            # 非 2xx 的回包同样消耗流量，也要计入
             w = self._sec_window()
             if ok:
                 if len(self.lat) < MAX_LAT:
                     self.lat.append(dt)
-                self.bytes += nbytes
                 w[0] += 1
                 w[2] += dt
                 w[3] = max(w[3], dt)
@@ -190,6 +193,9 @@ class Stats:
 
     def record_error(self, reason: str) -> None:
         key = reason.split(":")[0][:40] or "unknown"
+        # 10048 = 地址已被占用（端口用尽），10055 = 缓冲区不足；都是客户端侧瓶颈
+        if "10048" in reason or "10055" in reason:
+            self.port_exhausted = True
         with self._lock:
             self.total += 1
             self.errors[key] = self.errors.get(key, 0) + 1
@@ -499,7 +505,7 @@ def _tick(r: Run, last: tuple[int, float]) -> tuple[bool, tuple[int, float]]:
     el = now - r.stats.started
     qps = (total - last[0]) / max(1e-6, now - last[1])
     print(f"      t={el:5.1f}s  已完成 {total:>7}  "
-          f"瞬时 {qps:>7.0f} req/s", end="\r")
+          f"瞬时 {qps:>7.0f} req/s", end="\r", flush=True)
     if el >= r.stats.next_report:          # 长跑时定期留一行可回溯的累计概况
         r.stats.next_report = el + REPORT_EVERY
         rate = errs / total if total else 0.0
@@ -516,6 +522,7 @@ def run_threads(r: Run) -> float:
         t.start()
 
     last = (0, time.monotonic())
+    interrupted = False
     try:
         while time.monotonic() < r.deadline and not r.stats.abort.is_set():
             time.sleep(TICK)
@@ -523,14 +530,22 @@ def run_threads(r: Run) -> float:
             if not go:
                 break
     except KeyboardInterrupt:
+        interrupted = True
         r.stats.interrupt()
 
-    stop_at = time.monotonic() + 3.0        # 中断后最多等 3 秒收尾，daemon 线程随进程退出
+    # 停止加压的时刻，而不是收尾完成的时刻：QPS 的分母只能算到这里，
+    # 否则等尾部请求的几秒钟会把吞吐算低。
+    stopped = min(time.monotonic(), r.deadline)
+    # 正常结束时必须等在途请求跑完，否则尾部请求被漏计、汇总数偏小；
+    # 主动中断时只宽限几秒，daemon 线程随进程退出。
+    grace = 3.0 if interrupted else min(60.0, r.timeout + 5.0)
+    stop_at = time.monotonic() + grace
     for t in threads:
-        if time.monotonic() > stop_at:
+        left = stop_at - time.monotonic()
+        if left <= 0:
             break
-        t.join(timeout=1)
-    return time.monotonic() - r.stats.started
+        t.join(timeout=left)
+    return stopped - r.stats.started
 
 
 def run_asyncio(r: Run) -> float:
@@ -563,11 +578,33 @@ def run_asyncio(r: Run) -> float:
 BAR = "=" * 74
 
 
-def pct(vals: list[float], q: float) -> float:
+def percentiles(vals, qs: tuple[float, ...]) -> tuple[list[float], float]:
+    """一次排序同时求多个分位数与最大值（毫秒）。
+
+    以前每个分位数各自 sorted 一次，200 万样本时等于 3 次全排序 + 3 份拷贝，
+    光收尾就要 1 秒多。现在只排一次。
+    """
     if not vals:
-        return 0.0
+        return [0.0] * len(qs), 0.0
     s = sorted(vals)
-    return s[min(len(s) - 1, max(0, int(round(len(s) * q)) - 1))]
+    n = len(s)
+    out = [s[min(n - 1, max(0, int(round(n * q)) - 1))] * 1000 for q in qs]
+    return out, s[-1] * 1000
+
+
+def steady_qps(stats: Stats, ramp_up: float, elapsed: float) -> float:
+    """爬坡结束后的稳态吞吐。爬坡期并发还在陆续启动，混进去会把 QPS 系统性算低。
+
+    稳态区间不足 3 秒时直接返回 0：样本太少的"稳态"只是噪声，报出来反而误导。
+    """
+    if elapsed - ramp_up < 3.0 or not stats.window:
+        return 0.0
+    secs = [s for s in stats.window if s >= ramp_up]
+    if not secs:
+        return 0.0
+    cnt = sum(stats.window[s][0] + stats.window[s][1] for s in secs)
+    span = min(elapsed - ramp_up, float(len(secs)))
+    return cnt / span if span > 0 else 0.0
 
 
 def parse_probe(raw: str) -> int:
@@ -648,9 +685,16 @@ _RE_QUOTED = re.compile(r'["\']([^"\'\s]{2,300}?)["\']')
 _RE_CSSCOMMENT = re.compile(r'/\*.*?\*/', re.S)
 
 
+REDIRECT_CODES = (301, 302, 303, 307, 308)
+
+
 def _http_fetch(url: str, timeout: float, max_bytes: int = 0,
-                method: str = "GET") -> tuple[int, dict[str, str], bytes]:
-    """同步取一次（扫描阶段用，串行、可控）。max_bytes 只对 GET 生效。"""
+                method: str = "GET", hops: int = 0) -> tuple[int, dict[str, str], bytes]:
+    """同步取一次（扫描阶段用，串行、可控）。max_bytes 只对 GET 生效。
+
+    自动跟随最多 5 次重定向：站点常把 http:// 跳到 https://、把 / 跳到 /index.html，
+    不跟随的话扫描会拿到一个空 body，然后误报「没找到资源」。
+    """
     t = Target(url)
     conn = _new_conn(t, timeout)
     try:
@@ -666,9 +710,15 @@ def _http_fetch(url: str, timeout: float, max_bytes: int = 0,
         body = resp.read(max_bytes) if method == "GET" else b""
         if method != "GET":
             resp.read()
-        return st, hdrs, body
     finally:
         _safe_close(conn)
+
+    loc = hdrs.get("location")
+    if st in REDIRECT_CODES and loc and hops < 5:
+        nxt = urljoin(url, loc)
+        if urlsplit(nxt).scheme in ("http", "https"):
+            return _http_fetch(nxt, timeout, max_bytes, method, hops + 1)
+    return st, hdrs, body
 
 
 def _object_size(url: str, timeout: float) -> int:
@@ -682,6 +732,8 @@ def _object_size(url: str, timeout: float) -> int:
         pass
     try:
         st, hd, body = _http_fetch(url, timeout, 1)
+        if not 200 <= st < 300:
+            return 0            # 4xx/5xx 是错误页不是资源，别把它的长度当成文件体积
         cr = hd.get("content-range", "")
         if "/" in cr:
             tot = cr.rsplit("/", 1)[1].strip()
@@ -689,7 +741,7 @@ def _object_size(url: str, timeout: float) -> int:
                 return int(tot)
         if st == 200:
             return int(hd.get("content-length", "0") or 0) or len(body)
-        return int(hd.get("content-length", "0") or 0)
+        return 0            # 206 却没给总长：体积未知，宁可不收也不虚报
     except Exception:                                  # noqa: BLE001
         return 0
 
@@ -773,13 +825,17 @@ def scan_assets(seed: str, timeout: float, min_size: int, max_items: int,
     sized: list[tuple[str, int]] = []
     tty = sys.stderr.isatty()
     probe_timeout = min(timeout, 8.0)      # 外链不可达时别把扫描拖成几分钟
-    for i, u in enumerate(cands, 1):
-        size = _object_size(u, probe_timeout)
-        if size > 0 and size >= min_size:      # 探不到体积的（404/不可达）直接丢弃
-            sized.append((u, size))
-        if tty:                                        # 管道/重定向下不打动态进度行
-            print(f"\r  称重 {i}/{len(cands)} … {size / 1024:,.0f} KB  {u[-52:]:<52}",
-                  end="", file=sys.stderr, flush=True)
+
+    # 并行称重：纯粹是 IO 等待，8 路并发能把 200 个候选从一分钟压到十几秒
+    workers = max(1, min(SCAN_WORKERS, len(cands)))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        sizes = pool.map(lambda u: (u, _object_size(u, probe_timeout)), cands)
+        for i, (u, size) in enumerate(sizes, 1):
+            if size > 0 and size >= min_size:   # 探不到体积的（404/不可达）直接丢弃
+                sized.append((u, size))
+            if tty:                                    # 管道/重定向下不打动态进度行
+                print(f"\r  称重 {i}/{len(cands)} … {size / 1024:,.0f} KB  "
+                      f"{u[-52:]:<52}", end="", file=sys.stderr, flush=True)
     if cands and tty:
         print("\r" + " " * 78 + "\r", end="", file=sys.stderr, flush=True)
 
@@ -1073,9 +1129,10 @@ def main() -> int:
         print(" " * 70, end="\r")
 
     total, errs, statuses = stats.snapshot()
-    lat = list(stats.lat)
     qps = total / elapsed if elapsed else 0.0
-    p50, p95, p99 = (round(pct(lat, q) * 1000, 1) for q in (0.50, 0.95, 0.99))
+    sqps = steady_qps(stats, args.ramp_up, elapsed)      # 去掉爬坡期的稳态吞吐
+    (p50, p95, p99), max_ms = percentiles(stats.lat, (0.50, 0.95, 0.99))
+    p50, p95, p99, max_ms = (round(x, 1) for x in (p50, p95, p99, max_ms))
     base_ms = round(base * 1000, 1)
     ratio = p95 / (base_ms or 1.0)
     hold = total > 0 and errs == 0 and all(s in (200, 206) for s in statuses)
@@ -1110,11 +1167,12 @@ def main() -> int:
         "elapsed_s": round(elapsed, 1),
         "requests": total,
         "achieved_qps": round(qps, 1),
+        "steady_qps": round(sqps, 1),
         "status": {str(k): v for k, v in sorted(statuses.items())},
         "errors": stats.errors,
         "error_rate": err_rate,
         "latency_ms": {"baseline": base_ms, "p50": p50, "p95": p95,
-                       "p99": p99, "max": round(max(lat) * 1000, 1) if lat else 0.0},
+                       "p99": p99, "max": max_ms},
         "egress_mb": round(stats.bytes / 1e6, 2),
         "throughput_mbps": round(mbps, 1),
         "held": hold,
@@ -1134,13 +1192,21 @@ def main() -> int:
     head = targets[0].label if len(targets) == 1 else f"{targets[0].label} 等 {len(targets)} 个"
     print(f"  目标               {head}")
     print(f"  并发 / 实际时长      {n} / {elapsed:.1f}s")
-    print(f"  完成请求 / 实际 QPS  {total:,} / {qps:,.0f} req/s")
+    print(f"  完成请求           {total:,}")
+    steady_txt = f"{sqps:,.0f}" if sqps else "—（稳态区间不足 3 秒）"
+    print(f"  QPS 整体 / 稳态      {qps:,.0f} / {steady_txt}")
     print(f"  状态码分布           {result['status']}")
     print(f"  错误               {err_rate:.2%}  {stats.errors or ''}")
-    print(f"  延迟 基线/p50/p95/p99  {base_ms:.0f} / {p50:.0f} / {p95:.0f} / {p99:.0f} ms")
+    print(f"  延迟 基线/p50/p95/p99  {base_ms:.0f} / {p50:.0f} / {p95:.0f} / {p99:.0f} ms"
+          f"（最大 {max_ms:.0f}）")
     print(f"  本次测试出流量       {result['egress_mb']} MB"
           f"（{mbs:.2f} MB/s · {mbps:.1f} Mbit/s）")
     print(f"\n  判定：{verdict}")
+    if stats.port_exhausted:
+        print(BAR)
+        print(" 诊断：出现了 WinError 10048/10055（本机临时端口/缓冲区耗尽）。")
+        print("       这是客户端瓶颈，不是站点限流——再加大并发只会得到更多超时。")
+        print("       缓解：降低并发、用 --engine asyncio 复用连接、或从带宽更大的一侧发起。")
     print(BAR)
     print(" 提示：容量边界应通过「分级加压」逐步逼近，单次跳到高并发只会得到崩溃结论。")
     print(BAR)
