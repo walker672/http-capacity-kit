@@ -74,14 +74,15 @@ A site's HTML is usually just a shell; the real bulk (images, video, audio) live
 python a2o_loadtest.py --scan --url https://example.com/ --min-size 1m --out urls.txt
 ```
 
-Pipeline: fetch the entry HTML → extract `src` / `href` / `poster` / `srcset` / `url()` / absolute URLs / addresses inside JS template literals → **follow JS and CSS level by level (2 levels by default, up to 36 files per level)** → weigh candidates in parallel (8 workers, `HEAD` or `Range 0-0` each) → sort by size and write the list.
+Pipeline: fetch the entry HTML → extract `src` / `href` / `poster` / `srcset` / `url()` / absolute URLs / addresses inside JS template literals → **follow JS and CSS level by level (2 levels by default, no practical per-level cap)** → weigh candidates in parallel (8 workers, `HEAD` or `Range 0-0` each) → sort by size and write the list.
 
 - Sends a few dozen ordinary GETs. It is not load testing and needs no `--authorized`
 - Follows up to 5 redirects, so `http→https` or `/→/index.html` cannot leave the scan with an empty page
 - Falls back to any-host scanning when nothing is found on the same host (CDNs and object storage often live on another domain)
 - 4xx/5xx responses are dropped: an error page has a size, but it is not an asset
 - Addresses that were extracted but could not be weighed (404, hotlink protection, network block) are summarised instead of vanishing silently
-- `--max-items` caps the list, `--scan-follow 0` skips JS/CSS
+- The list is **not truncated** by default: whatever the site has is what you get. Pass `--max-items 30` only when you want a cap
+- `--scan-follow 0` skips JS/CSS
 
 Two things about modern SPAs (Vite / webpack code splitting) matter, and the scanner handles both:
 

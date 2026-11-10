@@ -74,14 +74,15 @@ python a2o_loadtest.py --url https://example.com/assets/app.js \
 python a2o_loadtest.py --scan --url https://example.com/ --min-size 1m --out urls.txt
 ```
 
-流程：抓入口 HTML → 正则抽取 `src` / `href` / `poster` / `srcset` / `url()` / 绝对 URL / JS 模板字符串里的地址 → **按层递归跟读 JS/CSS（默认 2 层，每层最多 36 个）** → 并行称重（8 路 `HEAD` 或 `Range 0-0`）→ 按体积降序写清单。
+流程：抓入口 HTML → 正则抽取 `src` / `href` / `poster` / `srcset` / `url()` / 绝对 URL / JS 模板字符串里的地址 → **按层递归跟读 JS/CSS（默认 2 层，每层不设实际上限）** → 并行称重（8 路 `HEAD` 或 `Range 0-0`）→ 按体积降序写清单。
 
 - 只发几十次普通 GET，不算压测，不需要 `--authorized`
 - 自动跟随最多 5 次重定向，`http→https`、`/→/index.html` 这类跳转不会让扫描拿到空页面
 - 同域扫不到资源时自动放宽到任意主机（CDN / 对象存储常与站点不同域）
 - 4xx/5xx 响应一律丢弃：错误页有体积但不是资源，别让它混进清单
 - 抽到了地址但称不出体积的（被防盗链/网络拦、或 404）会单独汇总提示，不会静默消失
-- `--max-items` 控制清单长度，`--scan-follow 0` 只看首页不跟 JS
+- 清单默认**不截断**，站点上有多少就写多少；需要截断时才显式传 `--max-items 30`
+- `--scan-follow 0` 只看首页不跟 JS
 
 现代 SPA（Vite / webpack 拆包）要特别注意两点，扫描器都已处理：
 

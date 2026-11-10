@@ -98,8 +98,8 @@ ASSET_EXT = (".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".bmp", ".svg",
              ".pdf", ".zip", ".woff2", ".woff", ".ttf", ".otf",
              ".js", ".css", ".wasm")
 SCAN_HTML_MAX = 4 << 20       # 单个 HTML/CSS/JS 最多读 4MB，够抽 URL 了
-SCAN_PROBE_MAX = 200          # 最多给多少个候选做体积探测（每个一次 HEAD）
-SCAN_FOLLOW_MAX = 120         # 每层最多跟读多少个 JS/CSS（Vite/webpack 拆包常有 20~60 个 chunk）
+SCAN_FOLLOW_MAX = 2000        # 每层最多跟读多少个 JS/CSS（只是防失控的保险丝，
+                              # 正常站点几十个，实测到不了；Vite/webpack 拆包 20~60 个 chunk）
 SCAN_WORKERS = 8              # 并行称重的线程数：串行逐个 HEAD 在 200 个候选上要一分钟
 HLS_MAX = 2 << 20             # 单个 m3u8 最多读 2MB（正常只有几 KB）
 HLS_SAMPLES = 8               # 每个视频抽几个切片称重，用于外推总大小
@@ -920,15 +920,16 @@ def scan_assets(seed: str, timeout: float, min_size: int, max_items: int,
             print(f"  注意   {len(failed)} 个 JS/CSS 读取失败（重试后仍失败），"
                   f"其中的资源可能漏掉：{failed[0][-46:]}", file=sys.stderr)
 
-    cands = sorted(urls)[:SCAN_PROBE_MAX]
+    # 不截断候选：站点上有多少资源就称多少，清单才能完整
+    cands = sorted(urls)
     sized: list[tuple[str, int]] = []
     dead: list[str] = []                   # 抽到了地址但称不出体积（404 / 连不上）
     hls_rows: list[dict] = []              # --hls 展开后的视频清单
     tty = sys.stderr.isatty()
     probe_timeout = min(timeout, 8.0)      # 外链不可达时别把扫描拖成几分钟
 
-    # HLS：m3u8 本身只有 1KB 左右，真正的字节在切片里。展开取最高码率档，
-    # 均匀抽几个切片称重后按数量外推，比逐个 HEAD 上百个切片快得多。
+    # HLS：m3u8 本身只有 1KB 左右，真正的字节在切片里。展开取最高码率档；
+    # 抽几个切片称重用来外推整档体积，其余切片照样逐个称重进清单（清单不抽样）。
     if hls:
         m3u8 = [u for u in cands if urlsplit(u).path.lower().endswith(".m3u8")]
         if m3u8 and tty:
@@ -946,10 +947,13 @@ def scan_assets(seed: str, timeout: float, min_size: int, max_items: int,
                     if good:
                         row["avg"] = int(statistics.mean(good))
                         row["est"] = row["avg"] * len(segs)
-                        # 抽到的切片按真实体积入清单，剩下的用估算值不进清单
+                        # 抽到的切片按真实体积入清单
                         sized.extend((s, n) for s, n in got if n > 0)
                     else:
                         row["err"] = "切片称不出体积"
+                    # 没抽到的切片也补进候选逐个称重 —— 清单要全量，不靠外推凑数
+                    weighed = {s for s, _ in got}
+                    cands.extend(s for s in segs if s not in weighed)
                 else:
                     row["err"] = "播放列表里没有切片"
             except Exception as exc:                   # noqa: BLE001
@@ -957,8 +961,9 @@ def scan_assets(seed: str, timeout: float, min_size: int, max_items: int,
             hls_rows.append(row)
         if m3u8 and tty:
             print("\r" + " " * 78 + "\r", end="", file=sys.stderr, flush=True)
-        # m3u8 本体不进体积表（1KB 的量级，只会占位置）
-        cands = [u for u in cands if not urlsplit(u).path.lower().endswith(".m3u8")]
+        # m3u8 本体不进体积表（1KB 的量级，只会占位置）；切片可能有重复，去重保序
+        cands = list(dict.fromkeys(
+            u for u in cands if not urlsplit(u).path.lower().endswith(".m3u8")))
 
     # 并行称重：纯粹是 IO 等待，8 路并发能把 200 个候选从一分钟压到十几秒
     workers = max(1, min(SCAN_WORKERS, len(cands)))
@@ -977,7 +982,9 @@ def scan_assets(seed: str, timeout: float, min_size: int, max_items: int,
         print("\r" + " " * 78 + "\r", end="", file=sys.stderr, flush=True)
 
     sized.sort(key=lambda x: -x[1])
-    return sized[:max_items], dead, hls_rows
+    if max_items > 0:
+        sized = sized[:max_items]
+    return sized, dead, hls_rows
 
 
 def run_scan(args, seed: str) -> int:
@@ -987,12 +994,12 @@ def run_scan(args, seed: str) -> int:
     except ValueError as exc:
         print(f"--min-size 无效：{exc}", file=sys.stderr)
         return 2
-    max_items = max(1, args.max_items)
+    max_items = max(0, args.max_items)
 
     print(BAR)
     print(f" 扫描   {seed}")
     print(f" 门槛   {'不限体积' if not min_size else f'>= {min_size / 1024:,.0f} KB'}"
-          f" · 最多 {max_items} 个"
+          f" · 条目 {'不限' if not max_items else f'最多 {max_items} 个'}"
           f" · 跟读 JS/CSS {'开' if args.scan_follow > 0 else '关'}"
           f" · 范围 {'任意主机' if args.any_host else '同域'}")
     print(BAR)
@@ -1094,8 +1101,9 @@ def main() -> int:
                     help="只扫描站点上的大文件（图片/视频/音频/JS），生成清单后退出，不压测")
     ap.add_argument("--min-size", default="0", metavar="N|1m",
                     help="--scan 时只保留体积 >= 该值的资源（默认 0，全部保留）")
-    ap.add_argument("--max-items", type=int, default=30,
-                    help="--scan 清单最多保留多少个资源（默认 30，按体积从大到小）")
+    ap.add_argument("--max-items", type=int, default=0,
+                    help="--scan 清单最多保留多少个资源（默认 0 = 不限制，全量保留；"
+                         "按体积从大到小，需要截断时显式传数字）")
     ap.add_argument("--scan-follow", type=int, default=2, metavar="N",
                     help="--scan 时跟读几层 JS/CSS 找资源（默认 2；SPA 拆包需要 2 层才够，"
                          "0 只看入口页 HTML）")
