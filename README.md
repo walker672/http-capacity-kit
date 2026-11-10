@@ -1,5 +1,7 @@
 # http-capacity-kit
 
+[![ci](https://github.com/walker672/http-capacity-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/walker672/http-capacity-kit/actions/workflows/ci.yml)
+
 两个零依赖的 Python 脚本，用来回答同一个问题：**我的站点到底能扛多少，瓶颈在哪一侧。**
 
 > English: [README.en.md](README.en.md)

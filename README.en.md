@@ -1,5 +1,7 @@
 # http-capacity-kit
 
+[![ci](https://github.com/walker672/http-capacity-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/walker672/http-capacity-kit/actions/workflows/ci.yml)
+
 Two zero-dependency Python scripts that answer one question: **how much can my site take, and which side is the bottleneck?**
 
 | Script | Role | Intensity |
