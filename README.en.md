@@ -1,6 +1,6 @@
 # http-capacity-kit
 
-[![ci](https://github.com/walker672/http-capacity-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/walker672/http-capacity-kit/actions/workflows/ci.yml)
+![self-check](https://img.shields.io/badge/self--check-offline%20%C2%B7%207%20assertions-blue)
 
 Two zero-dependency Python scripts that answer one question: **how much can my site take, and which side is the bottleneck?**
 
@@ -123,6 +123,28 @@ python a2o_probe.py --model-only                                 # no network, m
 Measures two TTFB figures — cold (full TCP + TLS handshake) and warm (keep-alive reuse) — then applies Little's law (`concurrency ≈ QPS × latency`) to model capacity, plus a header check: rate-limit responses, edge caching, compression, framing protection, HSTS, range support, long-lived caching.
 
 The ceiling of 5 connections / 150 requests is hard-coded, with no `--qps` or `--duration` flood parameters. That is deliberate: if you can model it, you do not need to hit it.
+
+## Self-check
+
+```bash
+python selfcheck.py
+```
+
+Seven assertions, fully offline, **no request is sent** and `--authorized` is not required: byte-compile, both `--help` screens, the `--dry-run` plan fields, malformed `--probe-bytes` must exit 2, 500 concurrency without `--authorized` must exit 3, and `--model-only` must produce usable output.
+
+```
+[PASS] byte-compile  a2o_loadtest.py a2o_probe.py
+[PASS] --help a2o_loadtest.py
+[PASS] --help a2o_probe.py
+[PASS] dry-run plan  probe=100B engine=threads segments=1 fuse=off
+[PASS] malformed --probe-bytes exits 2  exit=2
+[PASS] unauthorized high concurrency exits 3  exit=3
+[PASS] model-only output  asset_bytes=400,000
+
+all passed
+```
+
+Run it after touching either script to confirm the safety boundaries are intact. `.github/workflows/ci.yml` calls the same script, so local and CI results match. (The console output itself is Chinese.)
 
 ## FAQ
 

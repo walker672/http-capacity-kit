@@ -24,40 +24,5 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Byte-compile
-        run: python -m py_compile a2o_loadtest.py a2o_probe.py
-
-      - name: Help screens
-        run: |
-          python a2o_loadtest.py --help > /dev/null
-          python a2o_probe.py --help > /dev/null
-
-      # --dry-run prints the plan without sending a packet, so CI stays offline
-      - name: Dry-run plan
-        run: |
-          python a2o_loadtest.py --url https://example.com/ --concurrency 100 \
-            --duration 10 --max-egress-mb 100 --authorized --dry-run --json > plan.json
-          python -c "import json; p = json.load(open('plan.json')); assert p['concurrency'] == 100 and p['engine'] == 'threads' and p['segments'] == 1, p; print('plan ok:', p['probe_bytes'], 'B per request, fuse =', p['fuse'])"
-
-      - name: Reject malformed probe size
-        run: |
-          set +e
-          python a2o_loadtest.py --url https://example.com/ --probe-bytes wat --dry-run
-          rc=$?
-          set -e
-          [ "$rc" -eq 2 ] || { echo "expected exit 2, got $rc"; exit 1; }
-          echo "correctly rejected with exit 2"
-
-      - name: Refuse high concurrency without authorization
-        run: |
-          set +e
-          python a2o_loadtest.py --url https://example.com/ --concurrency 500 --dry-run
-          rc=$?
-          set -e
-          [ "$rc" -eq 3 ] || { echo "expected exit 3, got $rc"; exit 1; }
-          echo "correctly refused with exit 3"
-
-      - name: Model without network
-        run: |
-          python a2o_probe.py --model-only --json > model.json
-          python -c "import json; d = json.load(open('model.json')); assert d['model']['asset_bytes'] > 0; print('model ok:', d['model']['asset_bytes'], 'B assumed object size')"
+      - name: Self-check (offline, sends no packets)
+        run: python selfcheck.py

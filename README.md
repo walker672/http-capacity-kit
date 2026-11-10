@@ -1,6 +1,6 @@
 # http-capacity-kit
 
-[![ci](https://github.com/walker672/http-capacity-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/walker672/http-capacity-kit/actions/workflows/ci.yml)
+![self-check](https://img.shields.io/badge/self--check-offline%20%C2%B7%207%20assertions-blue)
 
 两个零依赖的 Python 脚本，用来回答同一个问题：**我的站点到底能扛多少，瓶颈在哪一侧。**
 
@@ -121,6 +121,28 @@ python a2o_probe.py --model-only                                 # 不联网，�
 测冷连接（TCP + TLS 全握手）与热连接（keep-alive 复用）两套 TTFB，再用 Little 定律 `并发 ≈ QPS × 延迟` 反推容量，附带一份响应头体检：限流响应、边缘缓存、内容压缩、防嵌套、HSTS、Range 支持、长缓存。
 
 硬上限 `5 并发 / 150 请求`，代码里写死，没有 `--qps` / `--duration` 这类洪泛参数。这是刻意的设计：能建模就不需要真压。
+
+## 本地自检
+
+```bash
+python selfcheck.py
+```
+
+7 条断言，全离线，**不发任何请求**，不需要 `--authorized`：字节码编译、两个 `--help`、`--dry-run` 计划字段、非法 `--probe-bytes` 必须 exit 2、500 并发不带 `--authorized` 必须 exit 3、`--model-only` 输出可用。
+
+```
+[PASS] 字节码编译  a2o_loadtest.py a2o_probe.py
+[PASS] --help a2o_loadtest.py
+[PASS] --help a2o_probe.py
+[PASS] dry-run 计划字段  probe=100B engine=threads segments=1 fuse=off
+[PASS] 非法 --probe-bytes 返回 2  exit=2
+[PASS] 未授权高并发返回 3  exit=3
+[PASS] model-only 输出  asset_bytes=400,000
+
+全部通过
+```
+
+改完脚本先跑一遍就知道有没有把安全边界改坏。CI（`.github/workflows/ci.yml`）调用的也是这个脚本，两边完全一致。
 
 ## 常见问题
 
