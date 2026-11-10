@@ -99,7 +99,7 @@ ASSET_EXT = (".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".bmp", ".svg",
              ".js", ".css", ".wasm")
 SCAN_HTML_MAX = 4 << 20       # 单个 HTML/CSS/JS 最多读 4MB，够抽 URL 了
 SCAN_PROBE_MAX = 200          # 最多给多少个候选做体积探测（每个一次 HEAD）
-SCAN_FOLLOW_MAX = 36          # 每层最多跟读多少个 JS/CSS（Vite/webpack 拆包常有 20+ chunk）
+SCAN_FOLLOW_MAX = 120         # 每层最多跟读多少个 JS/CSS（Vite/webpack 拆包常有 20~60 个 chunk）
 SCAN_WORKERS = 8              # 并行称重的线程数：串行逐个 HEAD 在 200 个候选上要一分钟
 HLS_MAX = 2 << 20             # 单个 m3u8 最多读 2MB（正常只有几 KB）
 HLS_SAMPLES = 8               # 每个视频抽几个切片称重，用于外推总大小
@@ -880,25 +880,45 @@ def scan_assets(seed: str, timeout: float, min_size: int, max_items: int,
             return urlsplit(u).path.lower().endswith((".js", ".css", ".mjs"))
 
         loaded: set[str] = set()
-        frontier = [u for u in urls if _is_code(u)][:SCAN_FOLLOW_MAX]
+        failed: list[str] = []
+        frontier = sorted(u for u in urls if _is_code(u))[:SCAN_FOLLOW_MAX]
         for _ in range(follow):
             nxt: list[str] = []
             for u in frontier:
                 if u in loaded:
                     continue
                 loaded.add(u)
-                try:
-                    _, _, txt = _http_fetch(u, timeout, SCAN_HTML_MAX)
-                    dec = txt.decode("utf-8", "replace")
-                except Exception:                      # noqa: BLE001
+                dec = ""
+                hard = False                   # 连接层失败才算真失败；干净 404 是预期的
+                for _try in range(2):           # 抖一次就丢掉整段媒体清单，值得重试
+                    try:
+                        st, _, txt = _http_fetch(u, timeout, SCAN_HTML_MAX)
+                    except Exception:              # noqa: BLE001
+                        hard = True
+                        continue
+                    hard = False
+                    if st < 400:
+                        dec = txt.decode("utf-8", "replace")
+                    break
+                if not dec:
+                    if hard:
+                        failed.append(u)
                     continue
                 more = _collect_urls(_RE_CSSCOMMENT.sub(" ", dec), u, host, same_host)
                 fresh = more - urls
                 urls |= more
-                nxt.extend(x for x in fresh if _is_code(x))
+                # 必须排序：nxt 来自集合差，遍历顺序随 hash 随机，再截断就会每次
+                # 漏掉不同的 chunk —— 表现为同一站点两次扫描结果不一样。
+                nxt.extend(sorted(x for x in fresh if _is_code(x)))
+            if len(nxt) > SCAN_FOLLOW_MAX:
+                print(f"  注意   发现 {len(nxt)} 个 JS/CSS，只跟读前 {SCAN_FOLLOW_MAX} 个"
+                      f"（--scan-follow 分层控制，或直接调大上限）", file=sys.stderr)
             frontier = nxt[:SCAN_FOLLOW_MAX]
             if not frontier:
                 break
+        if failed:
+            print(f"  注意   {len(failed)} 个 JS/CSS 读取失败（重试后仍失败），"
+                  f"其中的资源可能漏掉：{failed[0][-46:]}", file=sys.stderr)
 
     cands = sorted(urls)[:SCAN_PROBE_MAX]
     sized: list[tuple[str, int]] = []
