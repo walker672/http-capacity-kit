@@ -91,13 +91,19 @@ TIMELINE_ROWS = 300           # 无限运行时时序表只打印最后多少秒
 UA = "loadtest/2.3 (authorized; range-probe)"
 
 # 扫描：从 HTML/CSS/JS 里认这些后缀，且默认只留"大对象"
-ASSET_EXT = (".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".bmp",
+ASSET_EXT = (".jpg", ".jpeg", ".png", ".webp", ".avif", ".gif", ".bmp", ".svg",
              ".mp4", ".webm", ".mov", ".m4v", ".mkv",
              ".mp3", ".m4a", ".aac", ".wav", ".flac", ".ogg",
-             ".pdf", ".zip", ".woff2", ".woff", ".js", ".css")
+             ".m3u8", ".ts", ".mpd",
+             ".pdf", ".zip", ".woff2", ".woff", ".ttf", ".otf",
+             ".js", ".css", ".wasm")
 SCAN_HTML_MAX = 4 << 20       # 单个 HTML/CSS/JS 最多读 4MB，够抽 URL 了
 SCAN_PROBE_MAX = 200          # 最多给多少个候选做体积探测（每个一次 HEAD）
+SCAN_FOLLOW_MAX = 36          # 每层最多跟读多少个 JS/CSS（Vite/webpack 拆包常有 20+ chunk）
 SCAN_WORKERS = 8              # 并行称重的线程数：串行逐个 HEAD 在 200 个候选上要一分钟
+HLS_MAX = 2 << 20             # 单个 m3u8 最多读 2MB（正常只有几 KB）
+HLS_SAMPLES = 8               # 每个视频抽几个切片称重，用于外推总大小
+HLS_DEPTH = 3                 # master → 档位 → 切片，最多递归几层
 
 
 # ---------------------------------------------------------------- 目标解析
@@ -248,7 +254,18 @@ def _safe_close(obj) -> None:
         pass
 
 
+_PROXY: tuple[str, int] | None = None      # (host, port)，由 --proxy 设置
+
+
 def _new_conn(t: Target, timeout: float):
+    if _PROXY:
+        # 走 HTTP 代理：先连代理、发 CONNECT 建隧道，再在隧道上做 TLS。
+        # http.client 的 set_tunnel 正好是这个语义，host/port 传代理地址即可。
+        ph, pp = _PROXY
+        conn = http.client.HTTPSConnection(ph, pp, timeout=timeout,
+                                           context=ssl.create_default_context())
+        conn.set_tunnel(t.host, t.port)
+        return conn
     if t.secure:
         ctx = ssl.create_default_context()
         return http.client.HTTPSConnection(t.host, t.port, timeout=timeout, context=ctx)
@@ -676,7 +693,7 @@ def baseline_latency(targets: tuple[Target, ...], timeout: float,
 # 目的：站点上的 HTML 只是壳，真正的大体积数据（图片/视频/音频）散在
 # app.js、CSS、<img>/<video> 里。先把它们捞出来称重，再喂给 --url-file。
 
-_RE_ABS = re.compile(r'https?://[^\s"\'<>()\\,]+')
+_RE_ABS = re.compile(r"https?://[^\s\"'<>()\\,\`;|]+")
 _RE_ATTR = re.compile(r'(?:src|href|poster|data-src|data-original)\s*=\s*["\']([^"\']+)["\']',
                       re.I)
 _RE_SRCSET = re.compile(r'srcset\s*=\s*["\']([^"\']+)["\']', re.I)
@@ -746,6 +763,45 @@ def _object_size(url: str, timeout: float) -> int:
         return 0
 
 
+def _sample(seq: list, k: int) -> list:
+    """均匀抽 k 个元素（首尾都取到），用于切片抽样。"""
+    n = len(seq)
+    if n <= k:
+        return list(seq)
+    step = (n - 1) / (k - 1) if k > 1 else 0
+    return [seq[int(round(i * step))] for i in range(k)]
+
+
+def _hls_num(line: str, key: str) -> int:
+    m = re.search(rf"{key}=(\d+)", line)
+    return int(m.group(1)) if m else 0
+
+
+def _hls_expand(url: str, timeout: float, depth: int = 0) -> tuple[list[str], int]:
+    """把 m3u8 展开成切片 URL 列表。多档播放列表取平均码率最高的一档。
+    返回 (切片列表, 该档平均码率 bps)；码率未知时为 0。"""
+    if depth > HLS_DEPTH:
+        return [], 0
+    st, _, body = _http_fetch(url, timeout, HLS_MAX)
+    if not 200 <= st < 300:
+        raise RuntimeError(f"HTTP {st}")
+    lines = [ln.strip() for ln in body.decode("utf-8", "replace").splitlines() if ln.strip()]
+
+    best_uri, best_bw = None, 0
+    for i, ln in enumerate(lines):
+        if ln.startswith("#EXT-X-STREAM-INF"):
+            bw = _hls_num(ln, "AVERAGE-BANDWIDTH") or _hls_num(ln, "BANDWIDTH")
+            uri = next((x for x in lines[i + 1:] if not x.startswith("#")), None)
+            if uri and bw > best_bw:            # 取码率最高的一档
+                best_uri, best_bw = urljoin(url, uri), bw
+    if best_uri:
+        segs, _ = _hls_expand(best_uri, timeout, depth + 1)
+        return segs, best_bw
+
+    segs = [urljoin(url, ln) for ln in lines if not ln.startswith("#")]
+    return segs, 0
+
+
 def _is_asset_url(url: str) -> bool:
     path = urlsplit(url).path.lower()
     return path.endswith(ASSET_EXT)
@@ -755,9 +811,11 @@ def _collect_urls(text: str, base: str, host: str,
                   same_host: bool) -> set[str]:
     """从 HTML/CSS/JS 文本里捞出所有资源 URL，转成绝对地址并按主机过滤。"""
     found: set[str] = set()
+    sp_base = urlsplit(base)
+    origin = f"{sp_base.scheme}://{sp_base.netloc}/"
 
     def push(raw: str) -> None:
-        raw = raw.strip().strip("\"'")
+        raw = raw.strip().strip("\"'`")
         if not raw or raw.startswith(("data:", "blob:", "mailto:", "javascript:", "#")):
             return
         try:
@@ -770,9 +828,16 @@ def _collect_urls(text: str, base: str, host: str,
         if same_host and (sp.hostname or "").lower() != host.lower():
             return
         found.add(absu.split("#", 1)[0])
+        # 打包器（Vite/webpack）会把路径写成相对站点根的 "assets/x.js"。
+        # 相对当前 chunk 目录拼接会得到 /assets/assets/x.js，必然 404。
+        # 两个候选都收下，称重时拿到 0 的自然被丢弃。
+        if not raw.startswith(("/", "./", "../", "http://", "https://")):
+            alt = urljoin(origin, raw)
+            if alt != absu:
+                found.add(alt.split("#", 1)[0])
 
     for m in _RE_ABS.finditer(text):
-        push(m.group(0).rstrip("'\"),;"))
+        push(m.group(0).rstrip("'\"),;`"))
     for m in _RE_ATTR.finditer(text):
         push(m.group(1))
     for m in _RE_SRCSET.finditer(text):
@@ -790,7 +855,8 @@ def _collect_urls(text: str, base: str, host: str,
 
 
 def scan_assets(seed: str, timeout: float, min_size: int, max_items: int,
-                follow: int, same_host: bool = True) -> list[tuple[str, int]]:
+                follow: int, same_host: bool = True,
+                hls: bool = False) -> tuple[list[tuple[str, int]], list[str], list[dict]]:
     """抓 seed 页面 → 顺带读 JS/CSS → 汇总资源 → 逐个称重 → 只留大对象。"""
     host = urlsplit(seed).hostname or ""
     st, hd, body = _http_fetch(seed, timeout, SCAN_HTML_MAX)
@@ -807,32 +873,83 @@ def scan_assets(seed: str, timeout: float, min_size: int, max_items: int,
 
     urls = _collect_urls(html, seed, host, same_host)
 
-    # 跟随 JS/CSS：SPA 的资源清单基本都在打包后的 app.js 里
+    # 跟随 JS/CSS：SPA 的资源清单基本都在打包后的入口包里，媒体路径常在进一步
+    # 懒加载的 chunk 里，所以要按层递归，且每层不能只取固定的几个（Vite 拆包常 20+）。
     if follow > 0:
-        seeds = [u for u in urls if urlsplit(u).path.lower().endswith((".js", ".css"))][:8]
-        for u in seeds:
-            try:
-                _, _, txt = _http_fetch(u, timeout, SCAN_HTML_MAX)
-            except Exception:                          # noqa: BLE001
-                continue
-            try:
-                dec = txt.decode("utf-8", "replace")
-            except Exception:                          # noqa: BLE001
-                continue
-            urls |= _collect_urls(_RE_CSSCOMMENT.sub(" ", dec), u, host, same_host)
+        def _is_code(u: str) -> bool:
+            return urlsplit(u).path.lower().endswith((".js", ".css", ".mjs"))
+
+        loaded: set[str] = set()
+        frontier = [u for u in urls if _is_code(u)][:SCAN_FOLLOW_MAX]
+        for _ in range(follow):
+            nxt: list[str] = []
+            for u in frontier:
+                if u in loaded:
+                    continue
+                loaded.add(u)
+                try:
+                    _, _, txt = _http_fetch(u, timeout, SCAN_HTML_MAX)
+                    dec = txt.decode("utf-8", "replace")
+                except Exception:                      # noqa: BLE001
+                    continue
+                more = _collect_urls(_RE_CSSCOMMENT.sub(" ", dec), u, host, same_host)
+                fresh = more - urls
+                urls |= more
+                nxt.extend(x for x in fresh if _is_code(x))
+            frontier = nxt[:SCAN_FOLLOW_MAX]
+            if not frontier:
+                break
 
     cands = sorted(urls)[:SCAN_PROBE_MAX]
     sized: list[tuple[str, int]] = []
+    dead: list[str] = []                   # 抽到了地址但称不出体积（404 / 连不上）
+    hls_rows: list[dict] = []              # --hls 展开后的视频清单
     tty = sys.stderr.isatty()
     probe_timeout = min(timeout, 8.0)      # 外链不可达时别把扫描拖成几分钟
+
+    # HLS：m3u8 本身只有 1KB 左右，真正的字节在切片里。展开取最高码率档，
+    # 均匀抽几个切片称重后按数量外推，比逐个 HEAD 上百个切片快得多。
+    if hls:
+        m3u8 = [u for u in cands if urlsplit(u).path.lower().endswith(".m3u8")]
+        if m3u8 and tty:
+            print(f"\r  展开 {len(m3u8)} 个 HLS 播放列表…", end="", file=sys.stderr,
+                  flush=True)
+        for u in m3u8:
+            row = {"url": u, "segs": 0, "est": 0, "avg": 0, "bw": 0, "err": ""}
+            try:
+                segs, bw = _hls_expand(u, timeout)
+                row["segs"], row["bw"] = len(segs), bw
+                if segs:
+                    pick = _sample(segs, HLS_SAMPLES)
+                    got = [(s, _object_size(s, probe_timeout)) for s in pick]
+                    good = [n for _, n in got if n > 0]
+                    if good:
+                        row["avg"] = int(statistics.mean(good))
+                        row["est"] = row["avg"] * len(segs)
+                        # 抽到的切片按真实体积入清单，剩下的用估算值不进清单
+                        sized.extend((s, n) for s, n in got if n > 0)
+                    else:
+                        row["err"] = "切片称不出体积"
+                else:
+                    row["err"] = "播放列表里没有切片"
+            except Exception as exc:                   # noqa: BLE001
+                row["err"] = f"{type(exc).__name__}: {str(exc)[:40]}"
+            hls_rows.append(row)
+        if m3u8 and tty:
+            print("\r" + " " * 78 + "\r", end="", file=sys.stderr, flush=True)
+        # m3u8 本体不进体积表（1KB 的量级，只会占位置）
+        cands = [u for u in cands if not urlsplit(u).path.lower().endswith(".m3u8")]
 
     # 并行称重：纯粹是 IO 等待，8 路并发能把 200 个候选从一分钟压到十几秒
     workers = max(1, min(SCAN_WORKERS, len(cands)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         sizes = pool.map(lambda u: (u, _object_size(u, probe_timeout)), cands)
         for i, (u, size) in enumerate(sizes, 1):
-            if size > 0 and size >= min_size:   # 探不到体积的（404/不可达）直接丢弃
-                sized.append((u, size))
+            if size > 0:
+                if size >= min_size:
+                    sized.append((u, size))
+            else:
+                dead.append(u)
             if tty:                                    # 管道/重定向下不打动态进度行
                 print(f"\r  称重 {i}/{len(cands)} … {size / 1024:,.0f} KB  "
                       f"{u[-52:]:<52}", end="", file=sys.stderr, flush=True)
@@ -840,7 +957,7 @@ def scan_assets(seed: str, timeout: float, min_size: int, max_items: int,
         print("\r" + " " * 78 + "\r", end="", file=sys.stderr, flush=True)
 
     sized.sort(key=lambda x: -x[1])
-    return sized[:max_items]
+    return sized[:max_items], dead, hls_rows
 
 
 def run_scan(args, seed: str) -> int:
@@ -860,16 +977,39 @@ def run_scan(args, seed: str) -> int:
           f" · 范围 {'任意主机' if args.any_host else '同域'}")
     print(BAR)
     try:
-        found = scan_assets(seed, args.timeout, min_size, max_items,
-                            args.scan_follow, not args.any_host)
+        found, dead, hls_rows = scan_assets(seed, args.timeout, min_size, max_items,
+                                            args.scan_follow, not args.any_host,
+                                            args.hls)
         if not found and not args.any_host:
             print("  同域没捞到资源，放宽到任意主机（CDN / 对象存储）再扫一次…",
                   file=sys.stderr)
-            found = scan_assets(seed, args.timeout, min_size, max_items,
-                                args.scan_follow, False)
+            found, dead, hls_rows = scan_assets(seed, args.timeout, min_size, max_items,
+                                                args.scan_follow, False, args.hls)
     except Exception as exc:                           # noqa: BLE001
         print(f"扫描失败：{type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
+
+    if dead:
+        hosts = sorted({urlsplit(u).hostname or "?" for u in dead})
+        print(f" 注意   {len(dead)} 个地址抽到了但称不出体积（404 或被网络拦截），"
+              f"已排除：{', '.join(hosts[:3])}{' …' if len(hosts) > 3 else ''}",
+              file=sys.stderr)
+
+    if hls_rows:
+        print(BAR)
+        print(" 视频（HLS 最高码率档，总体积按切片抽样外推）")
+        print(BAR)
+        for r in hls_rows:
+            if r["err"]:
+                print(f"  !  {r['url'][-58:]}  {r['err']}")
+                continue
+            print(f"  {r['est'] / 1e6:>8.1f} MB  {r['segs']:>3} 片 · "
+                  f"单片约 {r['avg'] / 1e6:.2f} MB · "
+                  f"{r['bw'] / 1e6:.1f} Mbps · {r['url'][-46:]}")
+        ok = [r for r in hls_rows if not r["err"]]
+        if ok:
+            print(f"  小计 {sum(r['est'] for r in ok) / 1e6:,.1f} MB，"
+                  f"共 {len(ok)} 个视频 {sum(r['segs'] for r in ok)} 个切片")
 
     if not found:
         print("没找到符合条件的资源。放宽一点：--min-size 0 --scan-follow 1 --any-host")
@@ -936,10 +1076,13 @@ def main() -> int:
                     help="--scan 时只保留体积 >= 该值的资源（默认 0，全部保留）")
     ap.add_argument("--max-items", type=int, default=30,
                     help="--scan 清单最多保留多少个资源（默认 30，按体积从大到小）")
-    ap.add_argument("--scan-follow", type=int, default=1, metavar="N",
-                    help="--scan 时跟读几层 JS/CSS 找资源（默认 1，0 只看入口页 HTML）")
+    ap.add_argument("--scan-follow", type=int, default=2, metavar="N",
+                    help="--scan 时跟读几层 JS/CSS 找资源（默认 2；SPA 拆包需要 2 层才够，"
+                         "0 只看入口页 HTML）")
     ap.add_argument("--any-host", action="store_true",
                     help="--scan 时不限制同域，跨域 CDN 资源也收进清单")
+    ap.add_argument("--hls", action="store_true",
+                    help="--scan 时展开 m3u8（取最高码率档），按切片抽样估算视频总体积")
     ap.add_argument("--out", default="urls.txt",
                     help="--scan 输出的清单文件路径（默认 urls.txt）")
     ap.add_argument("--fuse", action="store_true",
@@ -953,9 +1096,20 @@ def main() -> int:
                     help="声明已获站方授权；并发 > 5 时必填")
     ap.add_argument("--max-egress-mb", type=float, default=None, metavar="MB",
                     help="累计出流量超过该 MB 数即停止（长跑防意外账单）")
+    ap.add_argument("--proxy", default=None, metavar="http://host:port",
+                    help="经 HTTP 代理访问目标（CONNECT 隧道）。目标在墙内不可达、"
+                         "或必须走本机代理时用；注意此时瓶颈常常是代理而不是站点")
     ap.add_argument("--json", action="store_true", help="输出 JSON")
     ap.add_argument("--dry-run", action="store_true", help="只打印计划，不发包")
     args = ap.parse_args()
+
+    global _PROXY
+    if args.proxy:
+        ps = urlsplit(args.proxy if "//" in args.proxy else f"http://{args.proxy}")
+        if not ps.hostname:
+            print(f"--proxy 无效：{args.proxy}", file=sys.stderr)
+            return 2
+        _PROXY = (ps.hostname, ps.port or 8080)
 
     raw_urls: list[str] = []
     if args.url:
@@ -1017,6 +1171,10 @@ def main() -> int:
     engine = args.engine
     if engine == "auto":
         engine = "asyncio" if args.concurrency > 500 else "threads"
+    if _PROXY and engine == "asyncio":
+        print("代理隧道目前只在 threads 引擎实现，已切到 threads。"
+              "（走代理时瓶颈通常是代理本身，高并发也没有意义）", file=sys.stderr)
+        engine = "threads"
     cap = ASYNC_MAX if engine == "asyncio" else THREADS_MAX
     n = max(1, min(args.concurrency, cap))
     if args.concurrency > cap:
@@ -1053,6 +1211,7 @@ def main() -> int:
         "abort_on": sorted(abort_codes) if fuse_on else [],
         "probe_bytes": "full" if probe == FULL_BODY else probe,
         "segments": segments,
+        "proxy": f"{_PROXY[0]}:{_PROXY[1]}" if _PROXY else None,
     }
 
     if args.dry_run:
@@ -1067,6 +1226,8 @@ def main() -> int:
             print(f" 目标   {targets[0].label}")
             print(f"        等 {len(targets)} 个目标轮换（分散单对象限流，搬更多数据）")
         print(f" 并发   {n} 个虚拟用户 · 引擎 {engine}（{args.ramp_up:.0f}s 内阶梯爬升）")
+        if _PROXY:
+            print(f" 代理   {_PROXY[0]}:{_PROXY[1]}（CONNECT 隧道；瓶颈通常是代理而非站点）")
         if infinite:
             print(f" 时长   无限运行（爬坡 {args.ramp_up:.0f}s 后一直跑，Ctrl+C 停止并输出汇总）")
         else:
@@ -1148,8 +1309,10 @@ def main() -> int:
                        f"平均 {qps:,.0f} req/s")
         else:
             verdict = f"已熔断（{stats.abort_reason}）→ 容量边界在 {n} 并发以下"
-    elif hold and ratio < 5:
-        verdict = f"{n} 并发稳定通过，p95 仅为基线 {ratio:.1f}x → 余量充足"
+    elif hold and ratio <= 1.5:
+        verdict = f"{n} 并发稳定通过，p95 为基线 {ratio:.1f}x → 余量充足"
+    elif hold and ratio <= 3:
+        verdict = f"{n} 并发稳定通过，但 p95 已放大到基线 {ratio:.1f}x → 开始劣化"
     elif hold:
         verdict = f"{n} 并发未报错，但 p95 放大 {ratio:.1f}x → 接近饱和"
     elif errs == 0 and bad_codes:

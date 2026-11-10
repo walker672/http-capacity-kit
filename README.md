@@ -60,6 +60,7 @@ python a2o_loadtest.py --url https://example.com/assets/app.js \
 | `--probe-bytes` | 每请求读取字节数。`100`（默认）/ `64k` / `1m` / `full`（整档下载） |
 | `--segments` | 一轮循环内连续请求 N 段（不同 Range 偏移），单轮搬运量 ×N |
 | `--max-egress-mb` | 累计出流量上限，超过即停（长跑防账单失控） |
+| `--proxy` | 经 HTTP 代理访问（`http://host:port`，CONNECT 隧道）。目标直连不到、或必须走本机代理时用 |
 | `--timeout` | 单请求超时。带宽吃紧时建议 5，避免大量 TimeoutError 污染结论 |
 | `--fuse` | 自动熔断（默认关闭）：错误率超阈值或命中 `--abort-on` 状态码即停 |
 | `--json` | 机器可读输出 |
@@ -73,13 +74,36 @@ python a2o_loadtest.py --url https://example.com/assets/app.js \
 python a2o_loadtest.py --scan --url https://example.com/ --min-size 1m --out urls.txt
 ```
 
-流程：抓入口 HTML → 正则抽取 `src` / `href` / `poster` / `srcset` / `url()` / 绝对 URL → 跟读 JS/CSS（默认 1 层）再抽一遍 → 并行称重（8 路 `HEAD` 或 `Range 0-0`）→ 按体积降序写清单。
+流程：抓入口 HTML → 正则抽取 `src` / `href` / `poster` / `srcset` / `url()` / 绝对 URL / JS 模板字符串里的地址 → **按层递归跟读 JS/CSS（默认 2 层，每层最多 36 个）** → 并行称重（8 路 `HEAD` 或 `Range 0-0`）→ 按体积降序写清单。
 
 - 只发几十次普通 GET，不算压测，不需要 `--authorized`
 - 自动跟随最多 5 次重定向，`http→https`、`/→/index.html` 这类跳转不会让扫描拿到空页面
 - 同域扫不到资源时自动放宽到任意主机（CDN / 对象存储常与站点不同域）
 - 4xx/5xx 响应一律丢弃：错误页有体积但不是资源，别让它混进清单
+- 抽到了地址但称不出体积的（被防盗链/网络拦、或 404）会单独汇总提示，不会静默消失
 - `--max-items` 控制清单长度，`--scan-follow 0` 只看首页不跟 JS
+
+现代 SPA（Vite / webpack 拆包）要特别注意两点，扫描器都已处理：
+
+1. 资源清单不在入口包里，而在懒加载的 chunk 里 —— 所以要递归 2 层，只跟 1 层会漏掉所有媒体
+2. 打包器把路径写成相对站点根的 `assets/x.js`，按当前 chunk 目录拼接会变成 `/assets/assets/x.js`。扫描器两个候选都收下，404 的自然被丢弃
+
+### 视频：m3u8 展开（`--hls`）
+
+HLS 视频的 `.m3u8` 只是索引（约 1KB），真正的字节在 `.ts` 切片里，直接扫只能看到 1KB。
+
+```bash
+python a2o_loadtest.py --scan --url https://example.com/ --any-host --hls --out urls.txt
+```
+
+`--hls` 会读出多档播放列表、**取码率最高的一档**，均匀抽 8 个切片称重后按切片数外推总体积，并把抽到的切片写进清单：
+
+```
+ 视频（HLS 最高码率档，总体积按切片抽样外推）
+     166.7 MB   30 片 · 单片约 5.56 MB · 6.3 Mbps · .../4e7b08505001834824682296968/adp.10.m3u8
+     141.0 MB   23 片 · 单片约 6.13 MB · 6.4 Mbps · .../4e7b6e435001834824682297054/adp.10.m3u8
+  小计 582.6 MB，共 11 个视频 131 个切片
+```
 
 ### 搬运大体积数据
 
@@ -167,6 +191,22 @@ python selfcheck.py
 
 **Q：出流量封顶准吗？**
 准。额度在每次请求发出前预留，并发在途请求不会一起冲过上限。实测 8 并发 × 1MB 段、上限 20MB，停在 19.92MB。
+
+**Q：扫描时提示「抽到了但称不出体积」，或者目标域名连不上？**
+先分清两种原因：一是对象已删除、路径写错（真 404）；二是这台机器到该域名的网络被拦。用 `curl` 直连测一下：
+
+```bash
+curl -sI --noproxy '*' --max-time 10 https://目标域名/某文件
+```
+
+如果直连失败、走本机代理却成功，那就是出口问题，加 `--proxy` 让脚本经代理访问：
+
+```bash
+python a2o_loadtest.py --scan --url https://example.com/ --any-host --hls \
+    --proxy http://127.0.0.1:7890 --out urls.txt
+```
+
+注意扫描和压测的公网出口不一样：扫描走代理能拿到清单，不代表压测能压到这个速度——**走代理时瓶颈通常在代理**。要测真实容量，还是从能直连的一侧发起。
 
 ## License
 

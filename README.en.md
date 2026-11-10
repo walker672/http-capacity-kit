@@ -60,6 +60,7 @@ python a2o_loadtest.py --url https://example.com/assets/app.js \
 | `--probe-bytes` | Bytes read per request: `100` (default) / `64k` / `1m` / `full` (whole file) |
 | `--segments` | N sequential range requests per loop — N× data per round |
 | `--max-egress-mb` | Stop once cumulative egress exceeds N MB (protects against surprise bills) |
+| `--proxy` | Reach targets through an HTTP proxy (`http://host:port`, CONNECT tunnel) |
 | `--timeout` | Per-request timeout. Lower it to 5 when bandwidth is tight |
 | `--fuse` | Auto-abort on error-rate threshold or `--abort-on` status codes (off by default) |
 | `--json` | Machine-readable output |
@@ -73,13 +74,36 @@ A site's HTML is usually just a shell; the real bulk (images, video, audio) live
 python a2o_loadtest.py --scan --url https://example.com/ --min-size 1m --out urls.txt
 ```
 
-Pipeline: fetch the entry HTML → extract `src` / `href` / `poster` / `srcset` / `url()` / absolute URLs → follow JS and CSS (one level by default) and extract again → weigh candidates in parallel (8 workers, `HEAD` or `Range 0-0` each) → sort by size and write the list.
+Pipeline: fetch the entry HTML → extract `src` / `href` / `poster` / `srcset` / `url()` / absolute URLs / addresses inside JS template literals → **follow JS and CSS level by level (2 levels by default, up to 36 files per level)** → weigh candidates in parallel (8 workers, `HEAD` or `Range 0-0` each) → sort by size and write the list.
 
 - Sends a few dozen ordinary GETs. It is not load testing and needs no `--authorized`
 - Follows up to 5 redirects, so `http→https` or `/→/index.html` cannot leave the scan with an empty page
 - Falls back to any-host scanning when nothing is found on the same host (CDNs and object storage often live on another domain)
 - 4xx/5xx responses are dropped: an error page has a size, but it is not an asset
+- Addresses that were extracted but could not be weighed (404, hotlink protection, network block) are summarised instead of vanishing silently
 - `--max-items` caps the list, `--scan-follow 0` skips JS/CSS
+
+Two things about modern SPAs (Vite / webpack code splitting) matter, and the scanner handles both:
+
+1. The asset list is not in the entry bundle but in lazily loaded chunks — hence 2 levels of recursion; one level misses every media file
+2. Bundlers emit paths relative to the site root, e.g. `assets/x.js`. Joined against the current chunk's directory that becomes `/assets/assets/x.js`. The scanner keeps both candidates and lets the 404 fall away
+
+### Video: expanding m3u8 (`--hls`)
+
+An HLS `.m3u8` is only an index (~1 KB); the bytes live in `.ts` segments, so a plain scan sees 1 KB.
+
+```bash
+python a2o_loadtest.py --scan --url https://example.com/ --any-host --hls --out urls.txt
+```
+
+`--hls` reads the master playlist, **takes the highest-bitrate rendition**, weighs 8 evenly spaced segments and extrapolates the total from the segment count, then writes those segments into the list:
+
+```
+ Videos (highest HLS rendition, total extrapolated from sampled segments)
+     166.7 MB   30 segs · ~5.56 MB each · 6.3 Mbps · .../4e7b08505001834824682296968/adp.10.m3u8
+     141.0 MB   23 segs · ~6.13 MB each · 6.4 Mbps · .../4e7b6e435001834824682297054/adp.10.m3u8
+  subtotal 582.6 MB across 11 videos / 131 segments
+```
 
 ### Moving large volumes
 
@@ -169,6 +193,22 @@ No. The per-second window keeps the last 900 seconds and latency samples are cap
 
 **Q: Is the egress cap accurate?**
 Yes. Quota is reserved before each request, so in-flight requests cannot overshoot together. Measured: 8 concurrent × 1 MB segments against a 20 MB cap stopped at 19.92 MB.
+
+**Q: The scan says an address "could not be weighed", or the target host is unreachable.**
+Separate the two causes: the object is really gone (a true 404), or this machine cannot reach that host. Test with curl:
+
+```bash
+curl -sI --noproxy '*' --max-time 10 https://target-host/some-file
+```
+
+If direct fails but the local proxy works, it is an egress problem — add `--proxy`:
+
+```bash
+python a2o_loadtest.py --scan --url https://example.com/ --any-host --hls \
+    --proxy http://127.0.0.1:7890 --out urls.txt
+```
+
+Remember that scan and load test take different paths: a proxy that lets the scan produce a list does not mean the load test can hit those speeds — **the proxy is usually the bottleneck**. To measure real capacity, run from somewhere that can connect directly.
 
 ## License
 

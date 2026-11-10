@@ -28,14 +28,19 @@ if "%PROBE%"=="" set PROBE=100
 set /p SEG=Segments per round [default 1]: 
 if "%SEG%"=="" set SEG=1
 
+set /p PXY=HTTP proxy host:port, blank for direct [e.g. 127.0.0.1:7890]: 
+set "PXYARG="
+if not "%PXY%"=="" set "PXYARG=--proxy http://%PXY%"
+
 echo.
 echo Target   : %URL%
 echo Load     : concurrency=%CONC%  duration=%DUR%s  ramp-up=10s
 echo Probe    : %PROBE% bytes per request, %SEG% segment(s) per round
+echo Proxy    : %PXYARG%
 echo Abort    : Ctrl+C  (stats are printed before exit)
 echo.
 
-python a2o_loadtest.py --url "%URL%" --concurrency %CONC% --duration %DUR% --ramp-up 10 --probe-bytes "%PROBE%" --segments %SEG% --authorized
+python a2o_loadtest.py --url "%URL%" --concurrency %CONC% --duration %DUR% --ramp-up 10 --probe-bytes "%PROBE%" --segments %SEG% %PXYARG% --authorized
 set RC=%ERRORLEVEL%
 
 echo.
